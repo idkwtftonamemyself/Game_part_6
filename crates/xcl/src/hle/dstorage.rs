@@ -341,6 +341,21 @@ fn bcpack_fill_block(mode: u8) -> Option<Vec<u8>> {
     })
 }
 
+/// The page numbers of a physical-page destination: the snapshot taken at enqueue, except that
+/// a 0 entry (no page has it) is read again now. A retail title keeps its page arrays in its
+/// own tables and fills an entry after EnqueueRequest – its streaming requests were refused by
+/// the thousand with page 0. An array that had its pages at enqueue stays as it was snapshotted
+/// (titles also pass arrays on the stack).
+fn resolve_dest_pages(r: &Request, snapshot: &[usize]) -> Vec<usize> {
+    if snapshot.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(snapshot)) {
+        (0..snapshot.len())
+            .map(|k| if snapshot[k] != 0 { snapshot[k] } else { unsafe { (r.destination as *const usize).add(k).read_unaligned() } })
+            .collect()
+    } else {
+        snapshot.to_vec()
+    }
+}
+
 /// Where a refused BCPack request's fill goes: its virtual destination, or the physical pages
 /// it named (snapshot at enqueue, as for a request that runs).
 enum FillTarget {
@@ -914,7 +929,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             format_args!("mode {bc} has no decoder; XCL_DSTORAGE_BCPACK_PLACEHOLDER writes solid blocks and reports success"),
         );
         let target = if r.dest_physical_pages() {
-            FillTarget::Pages(dest_pages.ok_or(E_ACCESS_VIOLATION)?.to_vec())
+            FillTarget::Pages(resolve_dest_pages(r, dest_pages.ok_or(E_ACCESS_VIOLATION)?))
         } else {
             FillTarget::Virtual
         };
@@ -943,20 +958,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
 
     if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
-        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
-        // read again now. A retail title keeps its page arrays in its own tables and fills an
-        // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
-        let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
-            &late[..]
-        } else {
-            pages
-        };
-        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+        let pages = resolve_dest_pages(r, dest_pages.ok_or(E_ACCESS_VIOLATION)?);
+        if !crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]) {
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
