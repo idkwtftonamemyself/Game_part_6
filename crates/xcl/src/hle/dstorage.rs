@@ -1048,13 +1048,52 @@ struct QueueInner {
     bcpack_fill: AtomicBool,
 }
 
+/// What the memory at `p` is: the UMA committed window, or the VirtualQuery state of its region.
+fn region_of(p: usize) -> String {
+    let uma = crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, 1));
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        return format!("uma-committed {uma}, VirtualQuery failed");
+    }
+    format!(
+        "uma-committed {uma}, region base {:#x} size {:#x} state {:#x} protect {:#x}",
+        m.BaseAddress as usize, m.RegionSize, m.State, m.Protect
+    )
+}
+
+/// The request's fields and, for a virtual destination, the memory it writes to.
+fn request_detail(r: &Request) -> String {
+    let mut s = format!(
+        "options {:#x} (zlib {}, bcpack {}, {} source, source size {}, file offset {:#x}, intermediate {}), destination {:#x} ({} bytes, page offset {}, {})",
+        r.options,
+        r.zlib(),
+        r.bcpack(),
+        if r.memory_source() { "memory" } else { "file" },
+        r.source_size,
+        r.offset,
+        r.intermediate_size,
+        r.destination,
+        r.destination_size,
+        r.destination_page_offset,
+        if r.dest_physical_pages() { "physical pages" } else { "virtual" }
+    );
+    if !r.dest_physical_pages() {
+        s += &format!("; {}", region_of(r.destination as usize));
+    }
+    s
+}
+
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
-        FAILED.fetch_add(1, Ordering::Relaxed);
+        // every failure is logged for the first 32, then at powers of two
+        let k = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        let name = file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default();
+        if k <= 32 || k.is_power_of_two() {
+            crate::xlog_warn!("DirectStorage: a request failed ({hr:#x}) [failure {k}]: from {name}: {}", request_detail(&request));
+        }
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
-            crate::xlog_warn!("DirectStorage: a request failed ({hr:#x}): {} bytes from {}", request.destination_size, file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default());
             e.1 = Some(FirstError { hr, request, file: file.map(|f| f.path.clone()).unwrap_or_default() });
         }
         unsafe { SetEvent(self.error_event as HANDLE) };
