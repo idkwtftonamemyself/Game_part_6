@@ -302,6 +302,19 @@ fn bcpack_fill_from_env() -> bool {
     std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
+/// `XCL_DSTORAGE_BCPACK_PLACEHOLDER=1`: a BCPack request XCL cannot unpack (no rebuild for its
+/// mode) is not refused. Its destination gets solid blocks of its BCn format (as
+/// `XCL_DSTORAGE_BCPACK_FILL`) and the request succeeds, so the title keeps going. The textures
+/// are wrong (flat colour). Off by default: the title sees success for data it never got.
+fn bcpack_placeholder_from_env() -> bool {
+    std::env::var("XCL_DSTORAGE_BCPACK_PLACEHOLDER").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+}
+
+/// Whether a BCPack `mode` can run: a real decoder, or a placeholder when that is enabled.
+fn bcpack_runs(mode: u8) -> bool {
+    super::bcpack::can_decode(mode) || (bcpack_placeholder_from_env() && bcpack_fill_block(mode).is_some())
+}
+
 /// BC1 colour block: both endpoints magenta (565 `0xF81F`), every index 0.
 const BC1_MAGENTA: [u8; 8] = [0x1F, 0xF8, 0x1F, 0xF8, 0, 0, 0, 0];
 /// BC4 block: both endpoints 255, every index 0.
@@ -752,7 +765,7 @@ impl Request {
                 if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
                     return Err(E_DESTINATION_SIZE);
                 }
-                if !super::bcpack::can_decode(bc) {
+                if !bcpack_runs(bc) {
                     return Err(E_DECOMPRESSION);
                 }
             }
@@ -761,7 +774,7 @@ impl Request {
                 if self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
                 }
-                if !super::bcpack::can_decode(bc) {
+                if !bcpack_runs(bc) {
                     return Err(E_DECOMPRESSION);
                 }
             }
@@ -890,8 +903,22 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     };
 
     let bc = r.bcpack();
-    if r.swizzle() != 0 || (bc != 0 && !super::bcpack::can_decode(bc)) {
+    if r.swizzle() != 0 || (bc != 0 && !bcpack_runs(bc)) {
         return Err(E_DECOMPRESSION);
+    }
+
+    // placeholder: a mode with no rebuild gets solid blocks instead of its data
+    if bc != 0 && !super::bcpack::can_decode(bc) {
+        warn_once(
+            &format!("BCPack {} placeholder", bcpack_name(bc)),
+            format_args!("mode {bc} has no decoder; XCL_DSTORAGE_BCPACK_PLACEHOLDER writes solid blocks and reports success"),
+        );
+        let target = if r.dest_physical_pages() {
+            FillTarget::Pages(dest_pages.ok_or(E_ACCESS_VIOLATION)?.to_vec())
+        } else {
+            FillTarget::Virtual
+        };
+        return if bcpack_fill(r, &target) { Ok(()) } else { Err(E_ACCESS_VIOLATION) };
     }
 
     // the stages in the console's order: zlib, then BCPack
